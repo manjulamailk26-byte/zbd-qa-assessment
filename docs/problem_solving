@@ -1,0 +1,129 @@
+# Problem Solving
+
+---
+
+## Scenario 1: Lightning Payment Timeouts — Users Charged but Payout Fails
+
+> Happens 1% normally, 5% during traffic spikes.
+
+---
+
+### How I'd Reproduce It
+
+The failure pattern points to a race between the Lightning node's response time and the API's internal timeout threshold — most visible under load. I'd reproduce it like this:
+
+**Step 1 — Baseline reproduction (isolated)**
+- Use Toxiproxy (or a WireMock stub) in front of the Lightning node endpoint
+- Inject artificial latency: start at 3s, 5s, 10s, 20s to find the exact threshold where the API starts returning timeout errors while the payment still processes internally
+- Confirm whether the charge event is recorded *before* or *after* the Lightning node responds
+
+**Step 2 — Load-driven reproduction**
+- Run a k6 script with 80–120 concurrent virtual users all triggering payouts simultaneously
+- This degrades the Lightning node's response time naturally (or exhausts connection pool)
+- Monitor for: timeout error rate climbing toward 5%, and whether the user's balance is debited on those failed calls
+
+**Step 3 — Confirm the double-charge scenario**
+- On a timed-out request, immediately retry with the *same* payload but *no idempotency key*
+- Check if two debit events appear on the account — this confirms the core bug
+
+**Key tool:** Distributed trace correlation (e.g., Jaeger/Datadog) to see whether the debit SQL commit happens before or after the await on the Lightning response.
+
+---
+
+### What Testing Gap Allowed This
+
+Two gaps, honestly — and both are common in fast-moving fintech teams:
+
+**Gap 1 — No timeout chaos testing**  
+The happy-path tests almost certainly passed. But the failure mode isn't *"does it work?"* — it's *"what exactly happens when the external dependency is slow?"* Nobody wrote a test that says: *"if the Lightning node takes 45 seconds, verify the user is NOT charged."* That scenario was untested because it required fault injection infrastructure that didn't exist yet.
+
+**Gap 2 — No idempotency contract test**  
+Even if the timeout happens, a retry with a consistent idempotency key would prevent double-charging. The fact that users *are* being charged suggests the idempotency layer either doesn't exist or wasn't enforced in the retry path. There was no test validating: *"retrying the same payment request must never create two debits."*
+
+Underlying cause: QA was likely focused on functional correctness at the API layer, not on the payment *state machine* across partial failures — which is where financial bugs actually live.
+
+---
+
+### Prevention Strategy Going Forward
+
+**1. Fault injection as a first-class test type**  
+Add Toxiproxy to the integration test suite. Every external dependency (Lightning node, ZBD API, webhook endpoint) gets a slow/error variant tested in CI. Tests like *"Lightning node takes 30s → verify no charge and clean error returned"* become regression cases.
+
+**2. Idempotency contract test**  
+Automated test that sends the same payout request 3x with identical idempotency keys and asserts exactly one debit event in the ledger. Fails the build if this breaks.
+
+**3. Explicit payment state machine**  
+Define states: `PENDING → DEBITED → SENT → CONFIRMED` (or `→ FAILED → REVERSED`).  
+Rule: debit only transitions to `SENT` after Lightning confirmation. A timeout returns to `PENDING` and reverses the debit if the Lightning node never confirms. Test each state transition explicitly.
+
+**4. Load test in CI (weekly / pre-release)**  
+Run k6 at 100 concurrent users against staging before every release. Alert if timeout error rate exceeds 0.5% — catch degradation before it hits production's 5%.
+
+**5. Production canary metric**  
+Add a real-time dashboard metric: `charge_events / confirmed_payouts`. In a healthy system this should be 1:1. If it drifts above 1.0x, page on-call immediately.
+
+---
+
+---
+
+## Scenario 2: First QA Engineer at ZBD — Bitcoin/Lightning Payment Platform
+
+---
+
+### 30-Day Plan to Assess Gaps
+
+I treat the first 30 days as an *audit*, not a build. You can't fix what you don't understand.
+
+**Week 1 — Listen and map**
+- Shadow developers on PRs, standups, and incident reviews — I'm looking for where bugs are *actually* coming from, not where people guess they're coming from
+- Audit the current test surface: what automated tests exist? What's their pass rate? How long do they take? Are they trusted or skipped?
+- Pull the last 3 months of production incidents and tag each one: *"would a test have caught this?"*
+- Map the payment flow end-to-end: every API, every Lightning node integration, every wallet state change — draw it out and find the untested edges
+
+**Week 2 — Identify the highest-risk untested areas**
+- Focus specifically on money-movement paths: debit, credit, fee calculation, refund, partial failure
+- Find the idempotency story — does it exist? Is it tested?
+- Understand testnet/mainnet split: can I safely run automated tests against a sandbox without risking real sats?
+- Talk to the support team: what do *users* complain about? Support tickets are a goldmine for untested edge cases
+
+**Week 3 — Quick wins and baseline**
+- Write the 3–5 tests that would have caught the last major production bug — ship them immediately as the foundation of a regression suite
+- Set up test reporting visibility (even just a Slack bot posting CI results) — make the quality signal visible to the whole team
+- Document what I found: gap analysis, risk areas, recommended priorities — share it with engineering and product as a collaborative doc, not a blame document
+
+**Week 4 — Propose a lightweight QA process**
+- Propose a Definition of Done that includes test coverage for payment-critical paths
+- Define the testing pyramid for this specific stack: what belongs in unit vs integration vs E2E
+- Align with the team on one release-blocking rule: *"no PR merges if it touches money movement without a corresponding test"*
+
+---
+
+### Balancing Speed vs. Coverage for a Fast-Shipping Team
+
+My philosophy: **risk-weighted coverage, not percentage-based coverage.**
+
+A fast team doesn't need 80% code coverage — they need 100% coverage on the code that moves money and 0% friction on the code that changes a button color. I'd bucket everything into three tiers:
+
+| Tier | Examples | Testing approach |
+|------|----------|-----------------|
+| **Non-negotiable** | Payout amounts, fee calculation, rate limiting, fraud detection | Automated, blocks merge, runs on every PR |
+| **Best effort** | Webhook delivery, retry logic, balance display | Automated, runs nightly — failures alert but don't block |
+| **Manual / exploratory** | UI flows, new feature UX, edge case hunts | Scheduled exploratory sessions, not CI-gated |
+
+I'd make this policy *explicit and agreed-upon* with the team — not my unilateral decision. The fastest way to lose developer trust as a QA engineer is to block deploys for low-risk issues.
+
+---
+
+### Approach to Testing Financial Transactions with Real Money
+
+**Cardinal rule: real money only in production, and only via controlled synthetic monitors.**
+
+In practice:
+- **Local/CI:** All automated tests run against a mock Lightning node (WireMock or a local stub) — zero real sats, fast, no external dependencies
+- **Staging:** ZBD sandbox with testnet Bitcoin — functionally equivalent behavior, worthless coins. Full regression suite runs here pre-release
+- **Production:** One synthetic monitor only — a scheduled job that sends a 1-sat payout from a dedicated internal test account to another internal account, confirms receipt within 60s, and alerts if it fails. This is the "is prod alive?" heartbeat
+- **Incident runbooks:** Every test that *could* have a financial side effect has a documented rollback — what do we do if the test account accidentally gets real funds moved? Who has access to reverse it?
+
+For exploratory testing on a real-money system, I'd work with finance/ops to establish a dedicated QA budget — a small funded account specifically for intentional test transactions, with every transaction tagged `QA_TEST` in the ledger for reconciliation.
+
+The goal is never zero risk — it's *known, bounded, recoverable* risk.
