@@ -1,0 +1,191 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI/CD Pipeline — MockPaymentAPI
+# GitHub Actions workflow
+#
+# Triggers:
+#   - Every pull_request targeting main (runs full test suite, blocks bad merges)
+#   - Every push to main (runs tests + optional load test smoke)
+#
+# Jobs:
+#   1. lint         — basic code style check (fast feedback, runs first)
+#   2. unit-tests   — functional Jest test suite (blocks merge on failure)
+#   3. load-test    — k6 smoke run at 10 VUs (post-merge on main only)
+#
+# Design decisions:
+#   - Tests run before any deploy step — a failing test suite never reaches staging
+#   - Testnet API keys are stored as GitHub Secrets, never hardcoded
+#   - Load tests are NOT required to pass PRs (they're slow + noisy for dev iteration)
+#     but DO run on main to catch regressions before a release tag
+#   - Node version is pinned (not "latest") to avoid surprise breakage
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI — Test & Validate
+
+on:
+  pull_request:
+    branches: [main]          # Gate every PR into main
+  push:
+    branches: [main]          # Also run on direct pushes to main (post-merge)
+
+# Cancel in-progress runs for the same PR/branch to save CI minutes
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 1: Lint
+# Fast first gate — catches obvious issues before running the full suite.
+# Uses a lightweight ESLint config; adjust rules to match team standards.
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20 (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          # Cache npm deps to speed up successive runs
+          cache: "npm"
+          cache-dependency-path: src/MockPaymentAPI/package.json
+
+      - name: Install API dependencies
+        working-directory: src/MockPaymentAPI
+        run: npm ci
+
+      # If you add ESLint to the project, uncomment:
+      # - name: Run ESLint
+      #   working-directory: src/MockPaymentAPI
+      #   run: npm run lint
+
+      - name: Check for syntax errors
+        working-directory: src/MockPaymentAPI
+        # node --check exits non-zero on any parse errors without running the file
+        run: node --check server.js
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 2: Functional Tests (Jest + Supertest)
+# This is the merge gate. A failing test blocks the PR.
+# Runs AFTER lint passes — avoids wasting Jest setup time on broken syntax.
+# ─────────────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Functional Tests
+    runs-on: ubuntu-latest
+    needs: lint              # Only run if lint passed
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20 (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: src/MockPaymentAPI.Tests/package.json
+
+      # Install the API app's dependencies first (tests import server.js)
+      - name: Install API dependencies
+        working-directory: src/MockPaymentAPI
+        run: npm ci
+
+      # Install the test suite's own dependencies (Jest, Supertest)
+      - name: Install test dependencies
+        working-directory: src/MockPaymentAPI.Tests
+        run: npm ci
+
+      - name: Run test suite
+        working-directory: src/MockPaymentAPI.Tests
+        run: npm test
+        env:
+          # CI flag makes Jest use non-interactive output format
+          CI: true
+          # Node environment — tests should never use real credentials
+          NODE_ENV: test
+          # If your server reads an API key from env, set a testnet-only key here:
+          # TESTNET_API_KEY: ${{ secrets.TESTNET_API_KEY }}
+
+      # Upload test results as an artifact so they're visible in the PR checks tab
+      - name: Upload test results
+        if: always()         # Upload even on failure so we can debug
+        uses: actions/upload-artifact@v4
+        with:
+          name: jest-results
+          path: src/MockPaymentAPI.Tests/jest-results.xml
+          retention-days: 7  # Keep for one week, then auto-delete
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 3: Load Test Smoke (k6)
+# Runs only on pushes to main (not on PRs — too slow and noisy for dev loop).
+# Uses a reduced VU count (10 users) for a quick smoke check that the API
+# doesn't collapse under light concurrency post-merge.
+# Full 100-VU spike tests should be run manually or on a release tag.
+# ─────────────────────────────────────────────────────────────────────────────
+  load-test-smoke:
+    name: Load Test Smoke (k6)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    # Only run on main branch pushes, not on PRs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: src/MockPaymentAPI/package.json
+
+      - name: Install API dependencies
+        working-directory: src/MockPaymentAPI
+        run: npm ci
+
+      # Start the API server in the background
+      - name: Start MockPaymentAPI
+        working-directory: src/MockPaymentAPI
+        run: |
+          node server.js &
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
+          # Wait for server to be ready (retry up to 10 times)
+          for i in $(seq 1 10); do
+            curl -s http://localhost:3000/health && break
+            echo "Waiting for server... attempt $i"
+            sleep 2
+          done
+
+      # Install k6 — official GitHub Action
+      - name: Set up k6
+        uses: grafana/setup-k6-action@v1
+
+      # Run a SHORT smoke load test: 10 VUs for 30s
+      # Thresholds are defined inside load_test.js
+      - name: Run k6 smoke load test
+        run: |
+          k6 run \
+            --vus 10 \
+            --duration 30s \
+            --env BASE_URL=http://localhost:3000 \
+            --out json=load-test-results.json \
+            load-tests/load_test.js
+
+      # Upload k6 results for later analysis
+      - name: Upload load test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-load-results
+          path: load-test-results.json
+          retention-days: 14
+
+      # Clean up the background server
+      - name: Stop MockPaymentAPI
+        if: always()
+        run: kill $SERVER_PID || true
