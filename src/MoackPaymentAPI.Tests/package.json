@@ -1,0 +1,19 @@
+{
+  "name": "mock-payment-api-tests",
+  "version": "1.0.0",
+  "description": "Functional test suite for MockPaymentAPI",
+  "scripts": {
+    "test": "jest --runInBand --forceExit --verbose",
+    "test:coverage": "jest --runInBand --forceExit --coverage"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testTimeout": 15000
+  },
+  "dependencies": {
+    "supertest": "^6.3.3"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}
